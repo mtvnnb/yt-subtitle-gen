@@ -1,0 +1,11 @@
+[project]
+name = "yt-subtitle-gen"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pyside6>=6.9.1",
+    "requests>=2.32.4",
+    "yt-dlp>=2025.7.21",
+]
