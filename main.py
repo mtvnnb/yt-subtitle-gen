@@ -46,7 +46,6 @@ def write_srt_file(entries: list, output_path: str):
         for i, entry in enumerate(entries, 1):
             start_formatted = format_time_srt(entry['start'])
             end_formatted = format_time_srt(entry['end'])
-            # Final safety check
             if entry['end'] < entry['start']: end_formatted = start_formatted
             srt_file.write(f"{i}\n{start_formatted} --> {end_formatted}\n{entry['content']}\n\n")
 
@@ -62,29 +61,31 @@ class Worker(QObject):
         self.output_dir = output_dir
 
     def enforce_no_overlap(self, entries: list):
-        """
-        NEW: Final cleanup pass to guarantee no timestamps overlap.
-        """
+        """Final cleanup pass to guarantee no timestamps overlap."""
         for i in range(len(entries) - 1):
             current_entry = entries[i]
             next_entry = entries[i+1]
-            
-            # If the end of the current entry is after the start of the next one...
             if current_entry['end'] > next_entry['start']:
-                # ...trim the current entry's end time to match the next one's start time.
                 current_entry['end'] = next_entry['start']
 
     def split_into_sentences(self, entries: list) -> list:
+        """Splits logical blocks into final, single-sentence entries."""
         final_entries = []
         sentence_pattern = r'([^.?!]+[.?!])'
         for entry in entries:
             content = entry['content'].strip()
-            sentences = [s.strip() for s in re.findall(sentence_pattern, content)]
-            if not sentences or len(sentences) <= 1:
+            sentences = [s.strip() for s in re.findall(sentence_pattern, content) if s.strip()]
+            if not sentences:
+                if content: final_entries.append(entry)
+                continue
+            if len(sentences) == 1:
+                entry['content'] = sentences[0]
                 final_entries.append(entry)
                 continue
+            
             total_len = sum(len(s) for s in sentences)
             if total_len == 0: continue
+
             duration = entry['end'] - entry['start']
             current_time = entry['start']
             for sentence in sentences:
@@ -96,26 +97,46 @@ class Worker(QObject):
         return final_entries
 
     def create_logical_blocks(self, chunks: list) -> list:
+        """
+        REVISED: Stage 1.
+        Precisely groups raw chunks into blocks, respecting natural sentence breaks.
+        """
         logical_blocks = []
-        buffer = ""
-        start_time = -1
-        last_end_time = -1
+        current_block_chunks = []
         for chunk in chunks:
-            text = chunk['content']
-            if start_time < 0:
-                start_time = chunk['start']
-            buffer += text + " "
-            last_end_time = chunk['end']
-            if text.strip().endswith(('.', '?', '!')):
-                logical_blocks.append({"start": start_time, "end": last_end_time, "content": buffer.strip()})
-                buffer = ""
-                start_time = -1
-        if buffer.strip() and start_time >= 0:
-            logical_blocks.append({"start": start_time, "end": last_end_time, "content": buffer.strip()})
+            # Add the current chunk to our temporary block
+            current_block_chunks.append(chunk)
+            
+            # If the current chunk's text ends with punctuation, it's the end of a block.
+            if chunk['content'].strip().endswith(('.', '?', '!')):
+                content = " ".join(c['content'] for c in current_block_chunks)
+                start_time = current_block_chunks[0]['start']
+                end_time = current_block_chunks[-1]['end']
+                
+                logical_blocks.append({
+                    "start": start_time,
+                    "end": end_time,
+                    "content": content
+                })
+                # Reset for the next block
+                current_block_chunks = []
+
+        # If there are any leftover chunks, create a final block from them
+        if current_block_chunks:
+            content = " ".join(c['content'] for c in current_block_chunks)
+            start_time = current_block_chunks[0]['start']
+            end_time = current_block_chunks[-1]['end']
+            logical_blocks.append({
+                "start": start_time,
+                "end": end_time,
+                "content": content
+            })
+            
         return logical_blocks
 
     @Slot()
     def run(self):
+        """The main work loop for the thread."""
         self.log_message.emit("\n--- Starting New Batch ---")
         os.makedirs(self.output_dir, exist_ok=True)
         for task in self.tasks:
@@ -132,18 +153,14 @@ class Worker(QObject):
     def process_youtube_url(self, video_url: str):
         self.log_message.emit(f"[*] Processing URL: {video_url}")
         video_id = get_video_id(video_url)
-        if not video_id:
-            self.log_message.emit(f"[!] Invalid YouTube URL, skipping.")
-            return
+        if not video_id: self.log_message.emit(f"[!] Invalid YouTube URL, skipping."); return
 
         with yt_dlp.YoutubeDL({'quiet': True, 'skip_download': True, 'writeautomaticsub': True, 'subtitleslangs': ['en']}) as ydl:
             info = ydl.extract_info(video_url, download=False)
         title = info.get('title', 'N/A')
         
         subtitle_url, source = self.find_subtitle_url(info)
-        if not subtitle_url:
-            self.log_message.emit(f"[!] No English subtitles found for '{title}'")
-            return
+        if not subtitle_url: self.log_message.emit(f"[!] No English subtitles found for '{title}'"); return
         self.log_message.emit(f"    > Found {source} subtitles for '{title}'")
         
         response = requests.get(subtitle_url)
@@ -157,8 +174,6 @@ class Worker(QObject):
         
         logical_blocks = self.create_logical_blocks(raw_chunks)
         final_entries = self.split_into_sentences(logical_blocks)
-        
-        # Apply the final non-overlap cleanup pass
         self.enforce_no_overlap(final_entries)
         
         output_path = os.path.join(self.output_dir, f"{video_id}.srt")
@@ -170,14 +185,12 @@ class Worker(QObject):
         source = "manual" if 'subtitles' in info else "auto-generated"
         if subs_info and 'en' in subs_info:
             for sub_format in subs_info['en']:
-                if sub_format['ext'] == 'ttml':
-                    return sub_format['url'], source
+                if sub_format['ext'] == 'ttml': return sub_format['url'], source
         return None, None
 
     def process_local_srt_file(self, filepath: str):
         self.log_message.emit(f"[*] Processing local file: {filepath}")
-        with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read()
+        with open(filepath, 'r', encoding='utf-8') as f: content = f.read()
         
         srt_pattern = re.compile(r'\d+\n(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})\n(.*?)\n\n', re.DOTALL)
         
@@ -186,14 +199,10 @@ class Worker(QObject):
             for m in srt_pattern.finditer(content)
         ]
         
-        if not raw_chunks:
-            self.log_message.emit(f"[!] No valid entries found in {os.path.basename(filepath)}")
-            return
+        if not raw_chunks: self.log_message.emit(f"[!] No valid entries found in {os.path.basename(filepath)}"); return
         
         logical_blocks = self.create_logical_blocks(raw_chunks)
         final_entries = self.split_into_sentences(logical_blocks)
-        
-        # Apply the final non-overlap cleanup pass
         self.enforce_no_overlap(final_entries)
         
         filename = os.path.basename(filepath)
@@ -272,30 +281,22 @@ class SubtitleApp(QMainWindow):
     @Slot()
     def add_local_files_to_input(self):
         filepaths, _ = QFileDialog.getOpenFileNames(self, "Select .srt files", "", "SRT files (*.srt);;All files (*.*)")
-        if filepaths:
-            self.input_text.append("\n".join(filepaths))
+        if filepaths: self.input_text.append("\n".join(filepaths))
 
     @Slot()
     def start_processing(self):
         all_lines = self.input_text.toPlainText().strip()
-        if not all_lines:
-            QMessageBox.warning(self, "Input Required", "The input box is empty.")
-            return
+        if not all_lines: QMessageBox.warning(self, "Input Required", "The input box is empty."); return
 
         tasks = []
         for line in all_lines.splitlines():
             line = line.strip()
             if not line: continue
-            if line.startswith("http"):
-                tasks.append({'type': 'url', 'value': line})
-            elif os.path.exists(line):
-                tasks.append({'type': 'file', 'value': line})
-            else:
-                self.log_message(f"[!] SKIPPING: Unrecognized input: {line}")
+            if line.startswith("http"): tasks.append({'type': 'url', 'value': line})
+            elif os.path.exists(line): tasks.append({'type': 'file', 'value': line})
+            else: self.log_message(f"[!] SKIPPING: Unrecognized input: {line}")
         
-        if not tasks:
-            QMessageBox.critical(self, "No Valid Input", "Could not find any valid URLs or existing file paths.")
-            return
+        if not tasks: QMessageBox.critical(self, "No Valid Input", "Could not find any valid URLs or existing file paths."); return
 
         self.set_ui_state(is_running=True)
 
